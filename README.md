@@ -40,7 +40,15 @@ hunt. Full log: [`results/powerstat-after.txt`](results/powerstat-after.txt).
    Enabled via a `tmpfiles.d` rule that sets `/sys/power/mem_sleep` to `deep`
    at boot — bootloader-agnostic, no UKI/cmdline edit needed.
 
-Both changes are backed up and fully reversible (`./uninstall.sh`).
+3. **suspend-then-hibernate (optional, auto-enabled if ready).**
+   The idle action suspends to S3 first (instant resume for short breaks), then
+   auto-hibernates after `HibernateDelaySec` (default 90 min) for **zero drain**
+   on long idles — and no lost session if the battery dies. Auto-enabled when the
+   system is hibernate-ready (`disk` in `/sys/power/state` + `resume=` on cmdline,
+   which Omarchy pre-configures with a swapfile ≥ RAM). Force with `HIBERNATE=1`,
+   disable with `HIBERNATE=0`.
+
+All changes are backed up and fully reversible (`./uninstall.sh`).
 
 ---
 
@@ -87,11 +95,17 @@ cd fw12powersave
 ./install.sh
 ```
 
-Tune the timeouts (seconds) if you like:
+Tune via env vars:
 
 ```bash
-SCREENOFF_SEC=120 SUSPEND_SEC=900 ./install.sh
+SCREENOFF_SEC=120 SUSPEND_SEC=900 ./install.sh      # idle timeouts (seconds)
+HIBERNATE=0 ./install.sh                             # plain S3 suspend, no hibernate
+HIBERNATE_DELAY=2h ./install.sh                      # S3 -> hibernate after 2h
 ```
+
+**Hibernation prerequisites** (Omarchy sets these up by default): swap ≥ RAM,
+`resume=`/`resume_offset=` on the kernel cmdline, and the `resume` mkinitcpio
+hook. Test `systemctl hibernate` resumes cleanly before relying on it.
 
 ## ⚠️ Test S3 resume before relying on auto-suspend
 
@@ -112,6 +126,7 @@ If it hangs or wakes instantly, run `./uninstall.sh` (or just remove
 |---|---|
 | `~/.config/hypr/hypridle.conf` | replaced (timestamped backup kept) |
 | `/etc/tmpfiles.d/fw12-s3-deep.conf` | created → sets `mem_sleep=deep` at boot |
+| `/etc/systemd/sleep.conf.d/fw12-hibernate-delay.conf` | created (if hibernate enabled) → `HibernateDelaySec` |
 
 ## Verify it's working
 
