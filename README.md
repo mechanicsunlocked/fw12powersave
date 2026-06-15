@@ -11,14 +11,12 @@ took idle draw from ~3.5 W down toward ~1.3–1.8 W.
 ## Proof it works
 
 `powerstat` on a Framework 12 (i5-1334U, Omarchy/Hyprland), idle with screen off,
-**after** applying this repo — full log in [`results/powerstat-after.txt`](results/powerstat-after.txt):
+**after** applying this repo:
 
-```
-Summary:
-System:   1.69 Watts on average with standard deviation 0.08
-```
+![powerstat: 1.69 W average idle](results/powerstat-after.png)
 
-**~4 W → 1.69 W average**, below the GNOME/Fedora ~2 W reference that started the hunt.
+**~4 W → 1.69 W average**, below the GNOME/Fedora ~2 W reference that started the
+hunt. Full log: [`results/powerstat-after.txt`](results/powerstat-after.txt).
 
 ---
 
