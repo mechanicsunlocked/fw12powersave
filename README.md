@@ -1,91 +1,85 @@
 # fw12powersave
 
-Idle-power tuning for the **Framework Laptop 12** (13th-gen Intel, e.g. i5-1334U)
-on **Arch / Omarchy + Hyprland**, distilled from an actual debugging session that
-took idle draw from ~3.5 W down toward ~1.3–1.8 W.
+Idle-power + sleep tuning for the **Framework Laptop 12** (13th-gen Intel, e.g. i5-1334U)
+on **Arch / Omarchy + Hyprland**, distilled from a long real debugging session.
 
-> TL;DR: on this machine idle power is **not** a kernel / C-state problem. It's
-> **screen-off-on-idle + S3 suspend + brightness**. This repo applies the two
-> config changes that actually move the needle, and documents why.
+Two independent things, both proven on hardware:
+
+1. **Idle → ~1.7 W.** Turn the display fully OFF on idle. This is the big everyday battery win.
+2. **Sleep → use HIBERNATE, not suspend.** On FW12, suspend (s2idle *and* deep S3) breaks the
+   accelerometer/tablet-mode and resume is unstable — so this masks suspend and hibernates instead.
 
 ## Proof it works
 
-`powerstat` on a Framework 12 (i5-1334U, Omarchy/Hyprland), idle with screen off,
-**after** applying this repo:
+`powerstat`, idle with screen off, on a Framework 12 (i5-1334U, Omarchy/Hyprland):
 
 ![powerstat: 1.69 W average idle](results/powerstat-after.png)
 
-**~4 W → 1.69 W average**, below the GNOME/Fedora ~2 W reference that started the
-hunt. Full log: [`results/powerstat-after.txt`](results/powerstat-after.txt).
+**~4 W → 1.69 W average**, at/below the GNOME/Fedora reference. Full log:
+[`results/powerstat-after.txt`](results/powerstat-after.txt).
 
 ---
 
-## What it does
+## ⚠️ The big FW12 gotcha: do NOT suspend (s2idle or S3)
 
-`./install.sh` makes exactly two changes:
+On this machine, **suspending kills the ChromeOS-EC base accelerometer.** After resume the
+base accel (Bosch `bma422`, iio label `accel-base`) reads `0,0,0`, and `cros-ec-lid-angle`
+then returns the sentinel **`500`** — which breaks tablet-mode detection and auto-rotation.
 
-1. **hypridle: turn the display fully OFF on idle.**
-   The stock Omarchy hypridle launches an animated *screensaver* and never does
-   `dpms off` — which is the worst case for power. With the screen on, the
-   compositor scanning out to the panel pins the SoC package in shallow
-   **PC2/PC3 (~2.95 W)**. The moment the display turns off, the package reaches
-   **PC6/PC8 (~1.8 W)** *and* the backlight powers down. Installs a clean config:
-   lock + `dpms off` at **90 s**, suspend at **10 min**, idle-inhibitors respected
-   (so fullscreen *and* windowed video keep the screen on).
+- Happens on **both s2idle and deep S3**.
+- It's an **EC-firmware/chip bug below the kernel**: the `cros_ec_sensorhub` resume handler only
+  re-enables the FIFO interrupt and does no sensor re-init, so once the chip goes silent on
+  suspend, Linux can't revive it. Confirmed dead ends: driver unbind/rebind, full module reload,
+  `ectool motionsense` ODR/range/ec_rate pokes — **all fail**. **`ectool reboot_ec` does not fix
+  it and can hang the machine** (15-s power-button hold). Don't.
+- Only a **full re-probe — reboot or hibernate — revives it.**
+- s2idle resume is also **unstable** on FW12 (spontaneous reboot-on-resume).
+- Confirmed on **BIOS 03.06 and 03.07** (Framework SWFW issue
+  [#222](https://github.com/FrameworkComputer/SoftwareFirmwareIssueTracker/issues/222)); no
+  released kernel/firmware fix as of mid-2026.
 
-2. **S3 ("deep") suspend instead of s2idle.**
-   s2idle on this box never reaches deep platform idle (`slp_s0_residency` stays
-   **0**), so "suspend" drains noticeably. This BIOS *does* advertise S3
-   (`ACPI: PM: (supports S0 S3 S4 S5)`), which truly powers the SoC down.
-   Enabled via a `tmpfiles.d` rule that sets `/sys/power/mem_sleep` to `deep`
-   at boot — bootloader-agnostic, no UKI/cmdline edit needed.
-
-3. **suspend-then-hibernate (optional, auto-enabled if ready).**
-   The idle action suspends to S3 first (instant resume for short breaks), then
-   auto-hibernates after `HibernateDelaySec` (default 90 min) for **zero drain**
-   on long idles — and no lost session if the battery dies. Auto-enabled when the
-   system is hibernate-ready (`disk` in `/sys/power/state` + `resume=` on cmdline,
-   which Omarchy pre-configures with a swapfile ≥ RAM). Force with `HIBERNATE=1`,
-   disable with `HIBERNATE=0`.
-
-All changes are backed up and fully reversible (`./uninstall.sh`).
+**So the fix is: don't suspend — hibernate.** Hibernate does a full re-probe on resume (revives
+the accel), draws zero power, and avoids the unstable s2idle path.
 
 ---
 
-## The findings (why these and not the usual advice)
+## What `install.sh` does
 
-A side-by-side probe against the *same silicon* running stock Fedora settled it:
+1. **Idle (the power win):** hypridle locks + turns the **display off** at `SCREENOFF_SEC` (90 s).
+   With the screen on, the compositor pins the SoC package in shallow PC2/PC3 (~2.95 W);
+   screen-off lets it reach PC6/PC8 (~1.8 W) and powers down the backlight.
+2. **Away → hibernate:** at `AWAY_SEC` (10 min) idle **and on lid close** (logind), the machine
+   hibernates — *if* the system is hibernate-ready (swap ≥ RAM + `resume=` on cmdline; Omarchy
+   sets this up by default).
+3. **Masks `suspend.target` + `suspend-then-hibernate.target`** so the buggy suspend path can't
+   fire (from the menu, scripts, or anything else).
+4. Does **NOT** force S3 and does **NOT** install accelerometer resume hacks — both were tried
+   and don't work.
 
-| Metric | Omarchy (screen on) | Omarchy (screen off) | Fedora deep-idle |
-|---|---|---|---|
-| RAPL package | **2.95 W** | **1.81 W** | 1.66 W |
-| Package C6 / C8 | 0% / 0% | **58% / 10%** | deep |
-| cpuidle states | `C1/C2/C3_ACPI` | same | **same** |
-| `slp_s0` (S0ix) | 0 | 0 | 0 |
+If the system isn't hibernate-ready, install.sh keeps the screen-off idle win, skips the
+hibernate/mask steps, and tells you how to enable hibernation (or just shut down when away).
 
-Things that turned out to be **dead ends** (don't bother):
+---
 
-- **`intel_idle` native C6/C8/C10 / `intel_idle.no_acpi=1` / `max_cstate=10`.**
-  This CPU exposes only `C1/C2/C3_ACPI` (firmware ACPI `_CST`, no native table) —
-  and **stock Fedora shows the identical states.** It's normal for this Raptor
-  Lake-U part, not a distro bug. The cores already reach deep hardware states
-  despite the `C3` label (the package hits PC8). No kernel param changes this.
-- **Swapping to the CachyOS kernel.** Tried it; idle behaviour was identical.
-- **PCIe ASPM / runtime-PM tweaks.** Already fine; didn't move package power.
+## The findings (why these, and what *doesn't* work)
 
-What **actually** matters: **screen off** (compositor stops pinning the package
-shallow + backlight off) and **S3 suspend**. Plus brightness, which is the
-biggest single knob — Fedora's "2 W" reference was at 6–8% brightness.
+- **Idle power is screen-off + brightness, not CPU C-states.** This CPU only exposes
+  `C1/C2/C3_ACPI` (no native C6/C8/C10) — and **stock Fedora on the same silicon is identical**,
+  so it's normal, not a bug. Don't chase `intel_idle`, `mem_sleep`, kernel swaps, or
+  `pcie_aspm` — none of them moved idle power. Screen-off did (−1.1 W package) + backlight.
+- **S3 deep sleep is NOT worth enabling.** It gives better *suspend* power than s2idle, but on
+  FW12 it (and s2idle) breaks the accelerometer, so suspend is off the table entirely — hibernate
+  replaces it.
 
 ---
 
 ## Requirements
 
-- Framework Laptop 12 (or similar 13th-gen Intel U-series) — check `/sys/power/mem_sleep`
-  for `deep` to know if your BIOS supports S3.
-- Hyprland + `hypridle`.
-- systemd. `sudo` for the S3 `tmpfiles.d` rule.
-- Best on Omarchy (uses `omarchy-system-lock`); falls back to `loginctl lock-session` otherwise.
+- Framework Laptop 12 (or similar 13th-gen Intel ChromeOS-EC convertible).
+- Hyprland + `hypridle`; systemd; `sudo`.
+- For hibernate: swap ≥ RAM and `resume=`/`resume_offset=` on the kernel cmdline + the `resume`
+  mkinitcpio hook (Omarchy default). Check: `cat /sys/power/state` contains `disk`.
+- Best on Omarchy (uses `omarchy-system-lock`); falls back to `loginctl lock-session`.
 
 ## Install
 
@@ -95,64 +89,45 @@ cd fw12powersave
 ./install.sh
 ```
 
-Tune via env vars:
-
+Tune via env:
 ```bash
-SCREENOFF_SEC=120 SUSPEND_SEC=900 ./install.sh      # idle timeouts (seconds)
-HIBERNATE=0 ./install.sh                             # plain S3 suspend, no hibernate
-HIBERNATE_DELAY=2h ./install.sh                      # S3 -> hibernate after 2h
+SCREENOFF_SEC=120 AWAY_SEC=900 ./install.sh   # screen-off / hibernate timeouts (seconds)
+NO_HIBERNATE=1 ./install.sh                    # screen-off idle only; don't mask suspend or hibernate
 ```
 
-**Hibernation prerequisites** (Omarchy sets these up by default): swap ≥ RAM,
-`resume=`/`resume_offset=` on the kernel cmdline, and the `resume` mkinitcpio
-hook. Test `systemctl hibernate` resumes cleanly before relying on it.
-
-## ⚠️ Test S3 resume before relying on auto-suspend
-
-S3 resume is solid on the tested FW12 BIOS, but Framework Intel laptops have had
-deep-sleep quirks across gens. After installing, **test once manually**:
-
-```bash
-systemctl suspend     # screen/fans fully off
-# press power button to wake -> confirm it resumes cleanly
-```
-
-If it hangs or wakes instantly, run `./uninstall.sh` (or just remove
-`/etc/tmpfiles.d/fw12-s3-deep.conf`) and you're back on s2idle.
+⚠️ **Test `systemctl hibernate` resumes cleanly once** before trusting auto-hibernate.
 
 ## What gets changed
 
 | Path | Change |
 |---|---|
-| `~/.config/hypr/hypridle.conf` | replaced (timestamped backup kept) |
-| `/etc/tmpfiles.d/fw12-s3-deep.conf` | created → sets `mem_sleep=deep` at boot |
-| `/etc/systemd/sleep.conf.d/fw12-hibernate-delay.conf` | created (if hibernate enabled) → `HibernateDelaySec` |
+| `~/.config/hypr/hypridle.conf` | replaced (timestamped backup kept): lock+screen-off, hibernate when away |
+| `/etc/systemd/logind.conf.d/fw12-lid-hibernate.conf` | created → lid close hibernates |
+| `suspend.target`, `suspend-then-hibernate.target` | **masked** (suspend disabled) |
 
-## Verify it's working
+## Verify
 
 ```bash
-# package power with screen off (let it idle past the timeout first):
-e1=$(sudo cat /sys/class/powercap/intel-rapl:0/energy_uj); sleep 10; \
-e2=$(sudo cat /sys/class/powercap/intel-rapl:0/energy_uj); \
-awk -v a=$e1 -v b=$e2 'BEGIN{printf "%.2f W\n",(b-a)/10/1e6}'   # expect ~1.8 W
-
-cat /sys/power/mem_sleep            # expect: s2idle [deep]
+cat /sys/power/mem_sleep                        # informational
+systemctl is-enabled suspend.target             # -> masked
+# after a hibernate + resume, tablet sensors must be alive:
+for d in /sys/bus/iio/devices/iio:device*; do [ "$(cat $d/label 2>/dev/null)" = accel-base ] \
+  && echo "base accel: $(cat $d/in_accel_x_raw),$(cat $d/in_accel_y_raw),$(cat $d/in_accel_z_raw)"; done
 ```
 
-There's also `probe.sh` — the diagnostic script used in the investigation. Run it
-on any OS to dump cpuidle states, package C-states, S0ix, RAPL and battery draw
-for an apples-to-apples comparison.
+`probe.sh` dumps cpuidle states, package C-states, S0ix, RAPL and battery draw for comparison.
 
 ## Uninstall
 
 ```bash
-./uninstall.sh
+./uninstall.sh   # unmasks suspend, removes the lid drop-in, restores hypridle
 ```
 
-Restores the previous hypridle config and removes the S3 rule (reverts to s2idle
-on next boot; `echo s2idle | sudo tee /sys/power/mem_sleep` to revert immediately).
+## BIOS / firmware
 
----
+Check with `fwupdmgr get-updates`. As of mid-2026 the latest FW12 BIOS is **03.07** and there's a
+**UEFI dbx** security update — both worth applying (`sudo fwupdmgr update`), but note **03.07 does
+NOT fix the suspend/accelerometer bug**.
 
 ## License
 

@@ -1,59 +1,52 @@
 #!/usr/bin/env bash
-# fw12powersave installer — apply the idle-power fixes for Framework 12 + Hyprland.
-#   1. hypridle: lock + display OFF on idle, suspend(-then-hibernate) when away
-#   2. S3 ("deep") suspend via a tmpfiles.d rule
-#   3. (optional) suspend-then-hibernate: S3 first, auto-hibernate after a delay
-# Reversible: see uninstall.sh.  Overridable via env:
-#   SCREENOFF_SEC (default 90)   SUSPEND_SEC (default 600)
-#   HIBERNATE (auto|1|0, default auto)   HIBERNATE_DELAY (default 90min)
+# fw12powersave installer — Framework 12 idle-power + sleep tuning.
+#   1. Idle: hypridle lock + display OFF (the big battery win)
+#   2. Away: HIBERNATE on idle + lid-close, and MASK suspend
+#      (on FW12 suspend/s2idle/S3 breaks the cros-ec accelerometer — see README)
+# Reversible: see uninstall.sh.  Env overrides:
+#   SCREENOFF_SEC (default 90)  AWAY_SEC (default 600)  NO_HIBERNATE=1 (idle-only, leave suspend alone)
 set -euo pipefail
 
 SCREENOFF_SEC="${SCREENOFF_SEC:-90}"
-SUSPEND_SEC="${SUSPEND_SEC:-600}"
-HIBERNATE="${HIBERNATE:-auto}"
-HIBERNATE_DELAY="${HIBERNATE_DELAY:-90min}"
+AWAY_SEC="${AWAY_SEC:-600}"
 LOCK_SEC="$SCREENOFF_SEC"
 DPMS_SEC=$((SCREENOFF_SEC + 3))
 HYPRIDLE_CONF="$HOME/.config/hypr/hypridle.conf"
-TMPFILE_RULE="/etc/tmpfiles.d/fw12-s3-deep.conf"
-SLEEP_DROPIN="/etc/systemd/sleep.conf.d/fw12-hibernate-delay.conf"
+LID_DROPIN="/etc/systemd/logind.conf.d/fw12-lid-hibernate.conf"
 
 say(){ printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn(){ printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 die(){ printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
-command -v hypridle >/dev/null || die "hypridle not found — install it first (Hyprland idle daemon)."
+command -v hypridle >/dev/null || die "hypridle not found — install it first."
 
-# Lock/wake commands: prefer Omarchy's, fall back to generic.
+# lock/wake commands: prefer Omarchy's, else generic
 if command -v omarchy-system-lock >/dev/null 2>&1; then
-    LOCK_CMD="omarchy-system-lock"
-    BEFORE_SLEEP="OMARCHY_LOCK_ONLY=true omarchy-system-lock"
-    AFTER_SLEEP="sleep 1 && omarchy-system-wake"
+    LOCK_CMD="omarchy-system-lock"; BEFORE_SLEEP="OMARCHY_LOCK_ONLY=true omarchy-system-lock"; AFTER_SLEEP="sleep 1 && omarchy-system-wake"
     say "Detected Omarchy — using omarchy-system-lock."
 else
-    LOCK_CMD="loginctl lock-session"
-    BEFORE_SLEEP="loginctl lock-session"
-    AFTER_SLEEP="hyprctl dispatch dpms on"
+    LOCK_CMD="loginctl lock-session"; BEFORE_SLEEP="loginctl lock-session"; AFTER_SLEEP="hyprctl dispatch dpms on"
     say "No Omarchy — using loginctl lock-session."
 fi
 
-# Decide suspend vs suspend-then-hibernate.
+# hibernate decision
 hib_ready(){ grep -qw disk /sys/power/state 2>/dev/null && grep -q 'resume=' /proc/cmdline 2>/dev/null; }
-SUSPEND_ACTION="systemctl suspend"
-WRITE_DROPIN=0
-case "$HIBERNATE" in
-    0) say "Hibernation disabled (HIBERNATE=0) — plain S3 suspend." ;;
-    1) if hib_ready; then SUSPEND_ACTION="systemctl suspend-then-hibernate"; WRITE_DROPIN=1
-       else warn "HIBERNATE=1 but system not hibernate-ready (need 'disk' in /sys/power/state + resume= on cmdline) — using plain suspend."; fi ;;
-    *) if hib_ready; then SUSPEND_ACTION="systemctl suspend-then-hibernate"; WRITE_DROPIN=1; say "Hibernation looks ready — using suspend-then-hibernate."
-       else warn "No hibernate support detected — using plain S3 suspend (set up swap+resume= to enable)."; fi ;;
-esac
+USE_HIB=1
+if [ "${NO_HIBERNATE:-0}" = 1 ]; then USE_HIB=0; say "NO_HIBERNATE set — idle-only, leaving suspend untouched."
+elif ! hib_ready; then USE_HIB=0; warn "Not hibernate-ready (need 'disk' in /sys/power/state + resume= on cmdline). Idle-only; set up swap+resume to enable hibernate."
+else say "Hibernate-ready — will use hibernate for away + lid-close, and mask suspend."; fi
 
-# --- 1. hypridle config ------------------------------------------------------
+# remove any stale artifacts a previous (S3-era) version may have installed
+sudo rm -f /etc/tmpfiles.d/fw12-s3-deep.conf \
+           /usr/lib/systemd/system-sleep/50-fw12-cros-ec-accel \
+           /etc/systemd/sleep.conf.d/fw12-hibernate-delay.conf 2>/dev/null || true
+
+# --- hypridle config ---------------------------------------------------------
 mkdir -p "$(dirname "$HYPRIDLE_CONF")"
 [ -f "$HYPRIDLE_CONF" ] && { bak="$HYPRIDLE_CONF.bak.$(date +%s)"; cp "$HYPRIDLE_CONF" "$bak"; say "Backed up hypridle.conf -> $bak"; }
 
-cat > "$HYPRIDLE_CONF" <<EOF
+{
+cat <<EOF
 # Managed by fw12powersave (https://github.com/mechanicsunlocked/fw12powersave)
 general {
     lock_cmd = $LOCK_CMD
@@ -69,41 +62,44 @@ listener {
     on-timeout = $LOCK_CMD
 }
 
-# Display fully OFF just after locking — the real power win:
-# screen-on pins the SoC package in shallow PC2/PC3 (~2.95W); screen-off lets it
-# reach PC6/PC8 (~1.8W) and powers down the backlight.
+# Display OFF just after locking — the real power win (package PC2/PC3 ~2.95W ->
+# PC6/PC8 ~1.8W, backlight off).
 listener {
     timeout = $DPMS_SEC
     on-timeout = hyprctl dispatch dpms off
     on-resume = hyprctl dispatch dpms on
 }
+EOF
+if [ "$USE_HIB" = 1 ]; then
+cat <<EOF
 
-# After ${SUSPEND_SEC}s idle (locks first via before_sleep_cmd).
+# Away after ${AWAY_SEC}s -> HIBERNATE (NOT suspend: suspend kills the cros-ec
+# accelerometer on FW12; hibernate's full re-probe revives it + zero power).
 listener {
-    timeout = $SUSPEND_SEC
-    on-timeout = $SUSPEND_ACTION
+    timeout = $AWAY_SEC
+    on-timeout = systemctl hibernate
 }
 EOF
-say "Wrote $HYPRIDLE_CONF  (off @ ${SCREENOFF_SEC}s, '$SUSPEND_ACTION' @ ${SUSPEND_SEC}s)"
-
-# --- 2. S3 deep suspend ------------------------------------------------------
-if grep -qw deep /sys/power/mem_sleep 2>/dev/null; then
-    printf '# fw12powersave: use S3 (deep) suspend instead of s2idle\nw /sys/power/mem_sleep - - - - deep\n' \
-        | sudo tee "$TMPFILE_RULE" >/dev/null
-    sudo systemd-tmpfiles --create "$TMPFILE_RULE" >/dev/null 2>&1 || echo deep | sudo tee /sys/power/mem_sleep >/dev/null
-    say "Enabled S3 deep suspend -> $TMPFILE_RULE  (now: $(cat /sys/power/mem_sleep))"
-else
-    warn "BIOS does not advertise 'deep' in /sys/power/mem_sleep — skipping S3 (staying on s2idle)."
 fi
+} > "$HYPRIDLE_CONF"
+say "Wrote $HYPRIDLE_CONF"
 
-# --- 3. suspend-then-hibernate delay ----------------------------------------
-if [ "$WRITE_DROPIN" = 1 ]; then
-    sudo mkdir -p "$(dirname "$SLEEP_DROPIN")"
-    printf '# fw12powersave: S3 first, then hibernate after this delay.\n[Sleep]\nHibernateDelaySec=%s\n' "$HIBERNATE_DELAY" \
-        | sudo tee "$SLEEP_DROPIN" >/dev/null
-    sudo systemctl daemon-reload 2>/dev/null || true
-    say "Set suspend-then-hibernate delay -> $SLEEP_DROPIN (HibernateDelaySec=$HIBERNATE_DELAY)"
-    warn "TEST 'systemctl hibernate' resumes cleanly before trusting auto-hibernate."
+# --- suspend off + hibernate on + lid->hibernate -----------------------------
+if [ "$USE_HIB" = 1 ]; then
+    sudo systemctl unmask sleep.target hibernate.target >/dev/null 2>&1 || true
+    sudo systemctl mask suspend.target suspend-then-hibernate.target >/dev/null 2>&1 || true
+    say "Masked suspend.target + suspend-then-hibernate.target; hibernate enabled."
+    sudo mkdir -p "$(dirname "$LID_DROPIN")"
+    sudo tee "$LID_DROPIN" >/dev/null <<'EOF'
+# fw12powersave: hibernate on lid close (suspend is masked — it breaks the
+# cros-ec accelerometer on this machine; hibernate revives it on resume).
+[Login]
+HandleLidSwitch=hibernate
+HandleLidSwitchExternalPower=hibernate
+HandleLidSwitchDocked=ignore
+EOF
+    say "Lid close -> hibernate ($LID_DROPIN); applies next login."
+    warn "TEST 'systemctl hibernate' resumes cleanly once before trusting auto-hibernate."
 fi
 
 # --- restart hypridle --------------------------------------------------------
@@ -112,8 +108,8 @@ if command -v hyprctl >/dev/null 2>&1; then
     hyprctl dispatch exec hypridle >/dev/null 2>&1 || true
     say "Restarted hypridle."
 else
-    warn "hyprctl not on PATH — restart hypridle manually (or re-login)."
+    warn "hyprctl not on PATH — restart hypridle manually."
 fi
 
 echo
-say "Done. Idle (screen off) ~1.3-1.8W; away -> S3 then hibernate. Tune in $HYPRIDLE_CONF."
+say "Done. Idle (screen off) ~1.7W. Away/lid -> hibernate. Suspend is OFF on purpose."
