@@ -18,7 +18,17 @@ say(){ printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn(){ printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 die(){ printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
-command -v hypridle >/dev/null || die "hypridle not found — install it first."
+# Dependencies: hypridle is required (the rest — hyprctl, systemctl, loginctl,
+# omarchy-system-lock — ship with Hyprland/systemd/Omarchy). Install hypridle if
+# it's missing, via pacman or the detected AUR helper.
+if ! command -v hypridle >/dev/null 2>&1; then
+    say "hypridle not found — installing it."
+    if   command -v pacman >/dev/null 2>&1; then sudo pacman -S --needed --noconfirm hypridle
+    elif command -v yay    >/dev/null 2>&1; then yay -S --needed --noconfirm hypridle
+    elif command -v paru   >/dev/null 2>&1; then paru -S --needed --noconfirm hypridle
+    else die "no pacman/yay/paru found — install hypridle manually, then re-run."; fi
+    command -v hypridle >/dev/null 2>&1 || die "hypridle still not found after install attempt."
+fi
 
 # lock/wake commands: prefer Omarchy's, else generic
 if command -v omarchy-system-lock >/dev/null 2>&1; then
@@ -29,11 +39,24 @@ else
     say "No Omarchy — using loginctl lock-session."
 fi
 
-# hibernate decision
-hib_ready(){ grep -qw disk /sys/power/state 2>/dev/null && grep -q 'resume=' /proc/cmdline 2>/dev/null; }
+# hibernate decision. Beyond 'disk' support + resume= on cmdline, the initramfs
+# must actually TRIGGER the resume, else hibernate writes the image but cold-boots
+# on wake (lost session) — which would make lid-close hibernate lose your work.
+# Accept the mkinitcpio 'resume' or 'systemd' hook (incl. conf.d drop-ins), or
+# dracut (handles resume natively). If mkinitcpio is present but neither hook is,
+# treat as not-ready.
+hib_ready(){
+  grep -qw disk /sys/power/state 2>/dev/null || return 1
+  grep -q 'resume=' /proc/cmdline 2>/dev/null || return 1
+  if command -v mkinitcpio >/dev/null 2>&1; then
+    cat /etc/mkinitcpio.conf /etc/mkinitcpio.conf.d/*.conf 2>/dev/null \
+      | grep -qE 'HOOKS.*(\bresume\b|\bsystemd\b)' || return 1
+  fi
+  return 0
+}
 USE_HIB=1
 if [ "${NO_HIBERNATE:-0}" = 1 ]; then USE_HIB=0; say "NO_HIBERNATE set — idle-only, leaving suspend untouched."
-elif ! hib_ready; then USE_HIB=0; warn "Not hibernate-ready (need 'disk' in /sys/power/state + resume= on cmdline). Idle-only; set up swap+resume to enable hibernate."
+elif ! hib_ready; then USE_HIB=0; warn "Not hibernate-ready (need 'disk' in /sys/power/state, resume= on cmdline, and a 'resume'/'systemd' initramfs hook). Idle-only; set up swap+resume to enable hibernate."
 else say "Hibernate-ready — will use hibernate for away + lid-close, and mask suspend."; fi
 
 # remove any stale artifacts a previous (S3-era) version may have installed
@@ -42,10 +65,29 @@ sudo rm -f /etc/tmpfiles.d/fw12-s3-deep.conf \
            /etc/systemd/sleep.conf.d/fw12-hibernate-delay.conf 2>/dev/null || true
 
 # --- hypridle config ---------------------------------------------------------
+# Never delete the user's existing config: back it up, comment its still-active
+# lines out IN PLACE (restorable), then append our managed block below.
+HB_BEGIN="# >>> fw12powersave (managed) - do not edit between markers >>>"
+HB_END="# <<< fw12powersave (managed) <<<"
+HB_CMARK="#fw12#"   # marks lines we commented out; uninstall.sh restores them
 mkdir -p "$(dirname "$HYPRIDLE_CONF")"
-[ -f "$HYPRIDLE_CONF" ] && { bak="$HYPRIDLE_CONF.bak.$(date +%s)"; cp "$HYPRIDLE_CONF" "$bak"; say "Backed up hypridle.conf -> $bak"; }
+if [ -f "$HYPRIDLE_CONF" ]; then
+    bak="$HYPRIDLE_CONF.bak.$(date +%s)"; cp "$HYPRIDLE_CONF" "$bak"; say "Backed up hypridle.conf -> $bak"
+    # Drop any previous managed block, then comment every still-active original
+    # line (idempotent: blanks and already-#fw12#-marked lines pass through).
+    awk -v b="$HB_BEGIN" -v e="$HB_END" -v cm="$HB_CMARK" '
+        $0==b {skip=1; next}
+        $0==e {skip=0; next}
+        skip {next}
+        /^[[:space:]]*$/ {print; next}
+        index($0,cm)==1 {print; next}
+        {print cm " " $0}
+    ' "$bak" > "$HYPRIDLE_CONF"
+    say "Commented out existing hypridle.conf lines (kept, not deleted)."
+fi
 
 {
+printf '%s\n' "$HB_BEGIN"
 cat <<EOF
 # Managed by fw12powersave (https://github.com/mechanicsunlocked/fw12powersave)
 general {
@@ -81,8 +123,9 @@ listener {
 }
 EOF
 fi
-} > "$HYPRIDLE_CONF"
-say "Wrote $HYPRIDLE_CONF"
+printf '%s\n' "$HB_END"
+} >> "$HYPRIDLE_CONF"
+say "Appended fw12powersave block to $HYPRIDLE_CONF"
 
 # --- suspend off + hibernate on + lid->hibernate -----------------------------
 if [ "$USE_HIB" = 1 ]; then
